@@ -10,6 +10,18 @@ from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
 
 
+def _release_host_memory():
+    """
+    Hand freed host memory back to the system. glibc keeps what the CPU copies of the weights used after the models
+    move to the GPU (about the size of the models), and the process would hold it until exit.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass    # not glibc
+
+
 class Trellis2ImageTo3DPipeline(Pipeline):
     """
     Pipeline for inferring Trellis2 image-to-3D models.
@@ -38,6 +50,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         'tex_slat_flow_model_1024',
         'tex_slat_decoder',
     ]
+    # Flow models each pipeline type runs, on top of the sparse structure models and the decoders
+    pipeline_type_flow_models = {
+        '512': ['shape_slat_flow_model_512', 'tex_slat_flow_model_512'],
+        '1024': ['shape_slat_flow_model_1024', 'tex_slat_flow_model_1024'],
+        '1024_cascade': ['shape_slat_flow_model_512', 'shape_slat_flow_model_1024', 'tex_slat_flow_model_1024'],
+        '1536_cascade': ['shape_slat_flow_model_512', 'shape_slat_flow_model_1024', 'tex_slat_flow_model_1024'],
+    }
 
     def __init__(
         self,
@@ -79,14 +98,32 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         self._device = 'cpu'
 
     @classmethod
-    def from_pretrained(cls, path: str, config_file: str = "pipeline.json") -> "Trellis2ImageTo3DPipeline":
+    def from_pretrained(
+        cls,
+        path: str,
+        config_file: str = "pipeline.json",
+        rembg_model_name: Optional[str] = "ZhengPeng7/BiRefNet",
+        pipeline_types: Optional[List[str]] = None,
+        low_vram: Optional[bool] = None,
+    ) -> "Trellis2ImageTo3DPipeline":
         """
         Load a pretrained model.
 
         Args:
             path (str): The path to the model. Can be either local path or a Hugging Face repository.
+            config_file (str): The pipeline config file in path.
+            rembg_model_name (str): The background removal model, in place of the config's briaai/RMBG-2.0 (CC BY-NC 4.0).
+                None keeps the config's model.
+            pipeline_types (list): Load only the flow models these pipeline types run, e.g. ['512'], to save memory.
+                None loads them all.
+            low_vram (bool): Move each model to the GPU only while it runs, in place of the config's setting (on by default).
+                Off keeps them all on the GPU: faster, and the host RAM drops to about 1 GB, but the 512 pipeline needs about 12 GB of VRAM.
         """
-        pipeline = super().from_pretrained(path, config_file)
+        model_names = None
+        if pipeline_types is not None:
+            model_names = [n for n in cls.model_names_to_load if 'flow_model_' not in n]
+            model_names += sorted({m for t in pipeline_types for m in cls.pipeline_type_flow_models[t]})
+        pipeline = super().from_pretrained(path, config_file, model_names=model_names)
         args = pipeline._pretrained_args
 
         pipeline.sparse_structure_sampler = getattr(samplers, args['sparse_structure_sampler']['name'])(**args['sparse_structure_sampler']['args'])
@@ -102,10 +139,15 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         pipeline.tex_slat_normalization = args['tex_slat_normalization']
 
         pipeline.image_cond_model = getattr(image_feature_extractor, args['image_cond_model']['name'])(**args['image_cond_model']['args'])
-        pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**args['rembg_model']['args'])
+        rembg_args = dict(args['rembg_model']['args'])
+        if rembg_model_name is not None:
+            rembg_args['model_name'] = rembg_model_name
+        pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**rembg_args)
         
-        pipeline.low_vram = args.get('low_vram', True)
+        pipeline.low_vram = args.get('low_vram', True) if low_vram is None else low_vram
         pipeline.default_pipeline_type = args.get('default_pipeline_type', '1024_cascade')
+        if pipeline_types is not None and pipeline.default_pipeline_type not in pipeline_types:
+            pipeline.default_pipeline_type = pipeline_types[0]
         pipeline.pbr_attr_layout = {
             'base_color': slice(0, 3),
             'metallic': slice(3, 4),
@@ -123,6 +165,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             self.image_cond_model.to(device)
             if self.rembg_model is not None:
                 self.rembg_model.to(device)
+            if torch.device(device).type != 'cpu':
+                _release_host_memory()
 
     def preprocess_image(self, input: Image.Image) -> Image.Image:
         """
@@ -587,7 +631,8 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 cond_1024, self.models['tex_slat_flow_model_1024'],
                 shape_slat, tex_slat_sampler_params
             )
-        torch.cuda.empty_cache()
+        if torch.accelerator.is_available():
+            torch.accelerator.empty_cache()
         out_mesh = self.decode_latent(shape_slat, tex_slat, res)
         if return_latent:
             return out_mesh, (shape_slat, tex_slat, res)

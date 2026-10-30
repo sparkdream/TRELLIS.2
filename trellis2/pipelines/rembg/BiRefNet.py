@@ -30,10 +30,10 @@ class BiRefNet:
         
     def __call__(self, image: Image.Image) -> Image.Image:
         image_size = image.size
-        input_images = self.transform_image(image).unsqueeze(0).to("cuda")
+        input_images = self.transform_image(image).unsqueeze(0).to(self.model.device, self.model.dtype)
         # Prediction
         with torch.no_grad():
-            preds = self.model(input_images)[-1].sigmoid().cpu()
+            preds = self.model(input_images)[-1].sigmoid().float().cpu()
         pred = preds[0].squeeze()
         pred_pil = transforms.ToPILImage()(pred)
         mask = pred_pil.resize(image_size)

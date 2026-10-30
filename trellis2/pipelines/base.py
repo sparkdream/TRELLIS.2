@@ -19,9 +19,12 @@ class Pipeline:
             model.eval()
 
     @classmethod
-    def from_pretrained(cls, path: str, config_file: str = "pipeline.json") -> "Pipeline":
+    def from_pretrained(cls, path: str, config_file: str = "pipeline.json", model_names: Optional[List[str]] = None) -> "Pipeline":
         """
         Load a pretrained model.
+
+        Args:
+            model_names (list): The models to load, in place of the class's model_names_to_load.
         """
         import os
         import json
@@ -36,9 +39,11 @@ class Pipeline:
         with open(config_file, 'r') as f:
             args = json.load(f)['args']
 
+        if model_names is None:
+            model_names = getattr(cls, 'model_names_to_load', None)
         _models = {}
         for k, v in args['models'].items():
-            if hasattr(cls, 'model_names_to_load') and k not in cls.model_names_to_load:
+            if model_names is not None and k not in model_names:
                 continue
             try:
                 _models[k] = models.from_pretrained(f"{path}/{v}")

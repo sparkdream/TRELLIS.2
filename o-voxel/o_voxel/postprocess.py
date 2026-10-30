@@ -6,9 +6,6 @@ import cv2
 from PIL import Image
 import trimesh
 import trimesh.visual
-from flex_gemm.ops.grid_sample import grid_sample_3d
-import nvdiffrast.torch as dr
-import cumesh
 
 
 def to_glb(
@@ -57,6 +54,11 @@ def to_glb(
         verbose: whether to print verbose messages
         use_tqdm: whether to use tqdm to display progress bar
     """
+    # CUDA-only dependencies, imported here so the rest of o_voxel works without them
+    from flex_gemm.ops.grid_sample import grid_sample_3d
+    import nvdiffrast.torch as dr
+    import cumesh
+
     # --- Input Normalization (AABB, Voxel Size, Grid Size) ---
     if isinstance(aabb, (list, tuple)):
         aabb = np.array(aabb)

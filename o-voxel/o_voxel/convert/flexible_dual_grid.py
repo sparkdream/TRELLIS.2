@@ -25,6 +25,22 @@ def _init_hashmap(grid_size, capacity, device):
     return hashmap_keys, hashmap_vals
 
 
+def _lookup_3d_torch(coords, query, grid_size):
+    """
+    PyTorch stand-in for the CUDA hashmap: index of each query in coords by sorted key search, -1 if absent or outside the grid.
+    """
+    W, H, D = grid_size.tolist()
+    def flat(c):
+        c = c.long()
+        return (c[:, 0] * H + c[:, 1]) * D + c[:, 2]
+    keys, order = flat(coords).sort()
+    q = flat(query)
+    inside = ((query >= 0) & (query < grid_size.to(query.device))).all(dim=1)
+    pos = torch.searchsorted(keys, q).clamp_(max=keys.shape[0] - 1)
+    found = inside & (keys[pos] == q)
+    return torch.where(found, order[pos], -1)
+
+
 @torch.no_grad()
 def mesh_to_flexible_dual_grid(
     vertices: torch.Tensor,
@@ -221,20 +237,23 @@ def flexible_dual_grid_to_mesh(
     N = dual_vertices.shape[0]
     mesh_vertices = (coords.float() + dual_vertices) / (2 * N) - 0.5
 
-    # Store active voxels into hashmap
-    hashmap = _init_hashmap(grid_size, 2 * N, device=coords.device)
-    _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap, torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1), *grid_size.tolist())
-
     # Find connected voxels
-    edge_neighbor_voxel = coords.reshape(N, 1, 1, 3) + flexible_dual_grid_to_mesh.edge_neighbor_voxel_offset      # (N, 3, 4, 3)
+    edge_neighbor_voxel = coords.reshape(N, 1, 1, 3) + flexible_dual_grid_to_mesh.edge_neighbor_voxel_offset.to(coords.device)      # (N, 3, 4, 3)
     connected_voxel = edge_neighbor_voxel[intersected_flag]                           # (M, 4, 3)
     M = connected_voxel.shape[0]
-    connected_voxel_hash_key = torch.cat([
-        torch.zeros((M * 4, 1), dtype=torch.int, device=coords.device),
-        connected_voxel.reshape(-1, 3)
-    ], dim=1)
-    connected_voxel_indices = _C.hashmap_lookup_3d_cuda(*hashmap, connected_voxel_hash_key, *grid_size.tolist()).reshape(M, 4).int()
-    connected_voxel_valid = (connected_voxel_indices != 0xffffffff).all(dim=1)
+    if _C is not None and coords.is_cuda:
+        # Store active voxels into hashmap
+        hashmap = _init_hashmap(grid_size, 2 * N, device=coords.device)
+        _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap, torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1), *grid_size.tolist())
+        connected_voxel_hash_key = torch.cat([
+            torch.zeros((M * 4, 1), dtype=torch.int, device=coords.device),
+            connected_voxel.reshape(-1, 3)
+        ], dim=1)
+        connected_voxel_indices = _C.hashmap_lookup_3d_cuda(*hashmap, connected_voxel_hash_key, *grid_size.tolist()).reshape(M, 4).int()
+        connected_voxel_valid = (connected_voxel_indices != 0xffffffff).all(dim=1)
+    else:
+        connected_voxel_indices = _lookup_3d_torch(coords, connected_voxel.reshape(-1, 3), grid_size).reshape(M, 4).int()
+        connected_voxel_valid = (connected_voxel_indices >= 0).all(dim=1)
     quad_indices = connected_voxel_indices[connected_voxel_valid].int()                             # (L, 4)
     L = quad_indices.shape[0]
 
@@ -277,7 +296,7 @@ def flexible_dual_grid_to_mesh(
             split_weight_ws_13 * mean_v13
         ) / (split_weight_ws_02 + split_weight_ws_13)
         mesh_vertices = torch.cat([mesh_vertices, mid_vertices], dim=0)
-        quad_indices = torch.cat([quad_indices, torch.arange(N, N + L, device='cuda').unsqueeze(1)], dim=1)
+        quad_indices = torch.cat([quad_indices, torch.arange(N, N + L, device=coords.device).unsqueeze(1)], dim=1)
         mesh_triangles = quad_indices[:, flexible_dual_grid_to_mesh.quad_split_train].reshape(-1, 3)
     
     return mesh_vertices, mesh_triangles

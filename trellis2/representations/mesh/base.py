@@ -1,8 +1,8 @@
 from typing import *
 import torch
+import warnings
 from ..voxel import Voxel
-import cumesh
-from flex_gemm.ops.grid_sample import grid_sample_3d
+# cumesh and flex_gemm are imported where they are used: neither is available on Intel GPUs
 
 
 class Mesh:
@@ -33,6 +33,11 @@ class Mesh:
         return self.to('cpu')
     
     def fill_holes(self, max_hole_perimeter=3e-2):
+        try:
+            import cumesh
+        except ImportError:
+            warnings.warn("cumesh is not installed: skipping hole filling")
+            return
         vertices = self.vertices.cuda()
         faces = self.faces.cuda()
         
@@ -57,6 +62,7 @@ class Mesh:
         self.faces = new_faces.to(self.device)
         
     def remove_faces(self, face_mask: torch.Tensor):
+        import cumesh
         vertices = self.vertices.cuda()
         faces = self.faces.cuda()
         
@@ -69,6 +75,7 @@ class Mesh:
         self.faces = new_faces.to(self.device)
         
     def simplify(self, target=1000000, verbose: bool=False, options: dict={}):
+        import cumesh
         vertices = self.vertices.cuda()
         faces = self.faces.cuda()
         
@@ -220,6 +227,7 @@ class MeshWithVoxel(Mesh, Voxel):
         )
         
     def query_attrs(self, xyz):
+        from flex_gemm.ops.grid_sample import grid_sample_3d
         grid = ((xyz - self.origin) / self.voxel_size).reshape(1, -1, 3)
         vertex_attrs = grid_sample_3d(
             self.attrs,
