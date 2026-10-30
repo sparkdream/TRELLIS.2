@@ -80,11 +80,13 @@ def _closest_point_on_triangles(p: torch.Tensor, a: torch.Tensor, b: torch.Tenso
     return out
 
 
-def _project_to_surface(points: torch.Tensor, vertices: torch.Tensor, faces: torch.Tensor, max_distance: float = 2.0, max_candidates: int = 1 << 23) -> Tuple[torch.Tensor, torch.Tensor]:
+def _project_to_surface(points: torch.Tensor, vertices: torch.Tensor, faces: torch.Tensor, normals: Optional[torch.Tensor] = None, max_distance: float = 2.0, max_candidates: int = 1 << 23) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Closest point on the mesh (vertices, faces) to each point, all in voxel units: triangles are bucketed by the voxel of
     their centre and each point searches the 3x3x3 voxels around it, so triangles must be about a voxel in size.
-    Points with no triangle within max_distance stay where they are. Returns (projected points, distances).
+    With normals (one per point), each point only moves along its normal, by the closest point's offset along it:
+    points around a corner of the mesh all have the corner as their closest point, and would pile up into zero-area
+    faces. Points with no triangle within max_distance stay where they are. Returns (projected points, distances).
     """
     device = points.device
     tri = vertices[faces]                                                       # (F, 3, 3)
@@ -114,6 +116,9 @@ def _project_to_surface(points: torch.Tensor, vertices: torch.Tensor, faces: tor
         winner = torch.zeros((p.shape[0], 3), device=device)
         winner[pid[is_best]] = cp[is_best]
         ok = best <= max_distance
+        if normals is not None:
+            n = normals[s:s + chunk]
+            winner = p + ((winner - p) * n).sum(dim=-1, keepdim=True) * n
         out[s:s + chunk][ok] = winner[ok]
         dist[s:s + chunk] = best
     return out, dist
@@ -282,8 +287,10 @@ def to_glb(
     v, f = _remove_small_components(v, f, min_piece_fraction * total_area)
     v, f = np.asarray(v), np.asarray(f)
     _log(verbose, t0, f"remeshed from the voxels: {len(v)} vertices, {len(f)} faces ({n_faces - len(f)} in specks removed)")
+    v_n = trimesh.Trimesh(v, f, process=False).vertex_normals
     v, dist = _project_to_surface(torch.tensor(v, dtype=torch.float32, device=device),
-                                  torch.tensor(in_v, dtype=torch.float32, device=device), torch.tensor(in_f, device=device))
+                                  torch.tensor(in_v, dtype=torch.float32, device=device), torch.tensor(in_f, device=device),
+                                  normals=torch.tensor(v_n, dtype=torch.float32, device=device))
     v = v.cpu().numpy().astype(np.float64) * vs + lo
     _log(verbose, t0, f"snapped onto the input mesh: {float(dist.isfinite().float().mean()) * 100:.1f}% of the vertices")
 
