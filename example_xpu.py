@@ -19,8 +19,7 @@ out_dir = sys.argv[3] if len(sys.argv) > 3 else "."
 os.makedirs(out_dir, exist_ok=True)
 device = "xpu" if torch.xpu.is_available() else "cuda"
 
-pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B", pipeline_types=[pipeline_type], low_vram=False)     # the Arc Pro B70 has 32 GB
-pipeline.to(device)
+pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B", pipeline_types=[pipeline_type], device=device)     # straight onto the GPU: the Arc Pro B70 has 32 GB
 
 mesh = pipeline.run(Image.open(image_path), pipeline_type=pipeline_type)[0]
 print(f"{mesh.vertices.shape[0]} vertices, {mesh.faces.shape[0]} faces")

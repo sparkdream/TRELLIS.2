@@ -3,23 +3,11 @@ import torch
 import torch.nn as nn
 import numpy as np
 from PIL import Image
-from .base import Pipeline
+from .base import Pipeline, _release_host_memory
 from . import samplers, rembg
 from ..modules.sparse import SparseTensor
 from ..modules import image_feature_extractor
 from ..representations import Mesh, MeshWithVoxel
-
-
-def _release_host_memory():
-    """
-    Hand freed host memory back to the system. glibc keeps what the CPU copies of the weights used after the models
-    move to the GPU (about the size of the models), and the process would hold it until exit.
-    """
-    try:
-        import ctypes
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except (OSError, AttributeError):
-        pass    # not glibc
 
 
 class Trellis2ImageTo3DPipeline(Pipeline):
@@ -105,6 +93,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         rembg_model_name: Optional[str] = "ZhengPeng7/BiRefNet",
         pipeline_types: Optional[List[str]] = None,
         low_vram: Optional[bool] = None,
+        device: Optional[str] = None,
     ) -> "Trellis2ImageTo3DPipeline":
         """
         Load a pretrained model.
@@ -118,12 +107,16 @@ class Trellis2ImageTo3DPipeline(Pipeline):
                 None loads them all.
             low_vram (bool): Move each model to the GPU only while it runs, in place of the config's setting (on by default).
                 Off keeps them all on the GPU: faster, and the host RAM drops to about 1 GB, but the 512 pipeline needs about 12 GB of VRAM.
+            device (str): Move each model to this device as soon as it is loaded, so the host RAM only ever holds about
+                one of them (instead of 13 GB for the 512 pipeline). Turns low_vram off.
         """
+        if device is not None:
+            low_vram = False
         model_names = None
         if pipeline_types is not None:
             model_names = [n for n in cls.model_names_to_load if 'flow_model_' not in n]
             model_names += sorted({m for t in pipeline_types for m in cls.pipeline_type_flow_models[t]})
-        pipeline = super().from_pretrained(path, config_file, model_names=model_names)
+        pipeline = super().from_pretrained(path, config_file, model_names=model_names, device=device)
         args = pipeline._pretrained_args
 
         pipeline.sparse_structure_sampler = getattr(samplers, args['sparse_structure_sampler']['name'])(**args['sparse_structure_sampler']['args'])
@@ -143,6 +136,10 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         if rembg_model_name is not None:
             rembg_args['model_name'] = rembg_model_name
         pipeline.rembg_model = getattr(rembg, args['rembg_model']['name'])(**rembg_args)
+        if device is not None:
+            pipeline.image_cond_model.to(device)
+            pipeline.rembg_model.to(device)
+            _release_host_memory()
         
         pipeline.low_vram = args.get('low_vram', True) if low_vram is None else low_vram
         pipeline.default_pipeline_type = args.get('default_pipeline_type', '1024_cascade')
@@ -154,7 +151,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             'roughness': slice(4, 5),
             'alpha': slice(5, 6),
         }
-        pipeline._device = 'cpu'
+        pipeline._device = device or 'cpu'
 
         return pipeline
 

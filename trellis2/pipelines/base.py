@@ -4,6 +4,18 @@ import torch.nn as nn
 from .. import models
 
 
+def _release_host_memory():
+    """
+    Hand freed host memory back to the system. glibc keeps what the CPU copies of the weights used after the models
+    move to the GPU (about the size of the models), and the process would hold it until exit.
+    """
+    try:
+        import ctypes
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass    # not glibc
+
+
 class Pipeline:
     """
     A base class for pipelines.
@@ -19,12 +31,13 @@ class Pipeline:
             model.eval()
 
     @classmethod
-    def from_pretrained(cls, path: str, config_file: str = "pipeline.json", model_names: Optional[List[str]] = None) -> "Pipeline":
+    def from_pretrained(cls, path: str, config_file: str = "pipeline.json", model_names: Optional[List[str]] = None, device: Optional[str] = None) -> "Pipeline":
         """
         Load a pretrained model.
 
         Args:
             model_names (list): The models to load, in place of the class's model_names_to_load.
+            device (str): Move each model to this device as soon as it is loaded, so the host RAM holds one at a time.
         """
         import os
         import json
@@ -49,6 +62,9 @@ class Pipeline:
                 _models[k] = models.from_pretrained(f"{path}/{v}")
             except Exception as e:
                 _models[k] = models.from_pretrained(v)
+            if device is not None:
+                _models[k].to(device)
+                _release_host_memory()
 
         new_pipeline = cls(_models)
         new_pipeline._pretrained_args = args

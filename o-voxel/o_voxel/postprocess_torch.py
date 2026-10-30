@@ -227,6 +227,7 @@ def to_glb(
     decimation_target: int = 200000,
     texture_size: int = 2048,
     min_component_area: float = 1e-5,
+    min_piece_fraction: float = 1e-4,
     blender: Optional[str] = None,
     verbose: bool = False,
 ) -> trimesh.Trimesh:
@@ -250,6 +251,8 @@ def to_glb(
         decimation_target: target number of faces for mesh simplification
         texture_size: size of the texture for baking
         min_component_area: connected components of the input mesh with less surface area are ignored
+        min_piece_fraction: separate pieces of the output with less than this fraction of its surface area are removed.
+            The default only drops specks; real but detached parts (e.g. a small accessory) are around 1e-3.
         blender: Blender executable for decimation and the UV unwrap; defaults to $BLENDER, then blender on the PATH
         verbose: print each step's duration
     """
@@ -274,7 +277,11 @@ def to_glb(
     v, f = _voxel_remesh(coords.detach().cpu().numpy().astype(np.int64))
     if trimesh.Trimesh(v, f, process=False).volume < 0:     # marching cubes winds consistently, but possibly inwards
         f = f[:, ::-1].copy()
-    _log(verbose, t0, f"remeshed from the voxels: {len(v)} vertices, {len(f)} faces")
+    n_faces = len(f)
+    total_area = trimesh.Trimesh(v, f, process=False).area
+    v, f = _remove_small_components(v, f, min_piece_fraction * total_area)
+    v, f = np.asarray(v), np.asarray(f)
+    _log(verbose, t0, f"remeshed from the voxels: {len(v)} vertices, {len(f)} faces ({n_faces - len(f)} in specks removed)")
     v, dist = _project_to_surface(torch.tensor(v, dtype=torch.float32, device=device),
                                   torch.tensor(in_v, dtype=torch.float32, device=device), torch.tensor(in_f, device=device))
     v = v.cpu().numpy().astype(np.float64) * vs + lo
