@@ -1,6 +1,8 @@
 from typing import *
+from contextlib import contextmanager
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from .base import Pipeline, _release_host_memory
@@ -373,6 +375,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             ], dim=1)
             coords = quant_coords.unique(dim=0)
             num_tokens = coords.shape[0]
+            print(f"cascade: {num_tokens} tokens at {hr_resolution}", flush=True)
             if num_tokens < max_num_tokens or hr_resolution == 1024:
                 if hr_resolution != resolution:
                     print(f"Due to the limited number of tokens, the resolution is reduced to {hr_resolution}.")
@@ -526,10 +529,85 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             )
         return out_mesh
     
+    @contextmanager
+    def _multi_view(self, n: int, angles: Optional[List[float]] = None, k: float = 3.0, eps: float = 0.05,
+                    by_facing: bool = True):
+        """
+        Condition on n views of the same object at once: at every sampling step each sampler runs the model once per
+        view (with its own guidance) and steps along a blend of their predictions, like TRELLIS's multidiffusion mode.
+        TRELLIS builds an object in its own canonical frame whatever the camera, so the views agree on one shape, and a
+        second view gives what the first can't see (depth for a front view). The views should show the same pose.
+
+        Without angles the blend is the plain mean, so a part only some views show (a dagger on one hip, a pouch on
+        the back) is outvoted by the views that can't see it. With each view's camera angle (see view_weights), each
+        voxel follows the views that can see it: in the sparse structure stage, by the occupancy decoded from the
+        current estimate of the finished object at each step; in the shape and texture stages, by the sparse
+        structure's voxels. With by_facing, also by how the surface faces each camera (view_weights.facing): for the
+        shape, a camera counts for what it sees edge-on, not for how deep what faces it lies; for the texture, the
+        reverse.
+        """
+        if n == 1:
+            yield
+            return
+        from . import view_weights
+        if angles is not None and (len(angles) != n or any(a is None for a in angles)):
+            angles = None
+        decoder = self.models['sparse_structure_decoder']
+        cache = {}
+
+        def dense_weights(sampler, x_t, t, preds):  # sparse structure: (n, 1, r, r, r) from the mean's decoded shape
+            x0 = sampler._pred_to_xstart(x_t, t, sum(preds[1:], preds[0]) / n)
+            dev = next(decoder.parameters()).device
+            occ = torch.sigmoid(decoder(x0.to(dev)).float())[0, 0].to(x_t.device)
+            vis = view_weights.transmittance(occ, angles, k)
+            if by_facing:
+                vis = vis * view_weights.facing(view_weights.normals(occ), angles, geometry=True)
+            return F.avg_pool3d(vis[:, None], occ.shape[0] // x_t.shape[2])
+
+        def sparse_weights(x_t, texture):  # shape and texture: (n, N, 1) at the voxels, the same for every step
+            key = (x_t.coords.data_ptr(), x_t.coords.shape[0], texture)
+            if key not in cache:
+                c = x_t.coords[:, 1:].long()
+                r = 1 << int(c.max().item()).bit_length()
+                occ = torch.zeros(r, r, r, device=c.device)
+                occ[c[:, 0], c[:, 1], c[:, 2]] = 1
+                vis = view_weights.transmittance(occ, angles, k)
+                if by_facing:
+                    vis = vis * view_weights.facing(view_weights.normals(occ), angles, geometry=not texture)
+                cache.clear()
+                cache[key] = vis[:, c[:, 0], c[:, 1], c[:, 2]][..., None]
+            return cache[key]
+
+        patched = []
+        for s in {id(x): x for x in (self.sparse_structure_sampler, self.shape_slat_sampler, self.tex_slat_sampler)}.values():
+            single = type(s)._inference_model
+
+            def views(model, x_t, t, cond, *args, _s=s, _single=single, **kwargs):
+                neg = kwargs.pop('neg_cond', None)
+                preds = []
+                for i in range(n):
+                    kw = dict(kwargs) if neg is None else {**kwargs, 'neg_cond': neg[i:i + 1]}
+                    preds.append(_single(_s, model, x_t, t, cond[i:i + 1], *args, **kw))
+                if angles is None or x_t.shape[0] != 1:
+                    return sum(preds[1:], preds[0]) / n
+                if isinstance(x_t, SparseTensor):
+                    w = sparse_weights(x_t, 'concat_cond' in kwargs)  # the texture stage is given the shape
+                    feats = view_weights.weigh([p.feats for p in preds], w, eps)
+                    return preds[0].replace(feats=feats)
+                return view_weights.weigh(preds, dense_weights(_s, x_t, t, preds), eps)
+
+            s._inference_model = views
+            patched.append(s)
+        try:
+            yield
+        finally:
+            for s in patched:
+                del s._inference_model
+
     @torch.no_grad()
     def run(
         self,
-        image: Image.Image,
+        image: Union[Image.Image, List[Image.Image]],
         num_samples: int = 1,
         seed: int = 42,
         sparse_structure_sampler_params: dict = {},
@@ -539,12 +617,13 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         return_latent: bool = False,
         pipeline_type: Optional[str] = None,
         max_num_tokens: int = 49152,
+        view_angles: Optional[List[float]] = None,
     ) -> List[MeshWithVoxel]:
         """
         Run the pipeline.
 
         Args:
-            image (Image.Image): The image prompt.
+            image (Image.Image or list): The image prompt, or several views of the same object (see _multi_view).
             num_samples (int): The number of samples to generate.
             seed (int): The random seed.
             sparse_structure_sampler_params (dict): Additional parameters for the sparse structure sampler.
@@ -554,6 +633,9 @@ class Trellis2ImageTo3DPipeline(Pipeline):
             return_latent (bool): Whether to return the latent codes.
             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
             max_num_tokens (int): The maximum number of tokens to use.
+            view_angles (list): For several views, each one's camera angle in degrees round the subject towards its own
+                left (0 front, 90 its left side, 180 back): each voxel then follows the views that see it. Without
+                them the views are averaged (see _multi_view).
         """
         # Check pipeline type
         pipeline_type = pipeline_type or self.default_pipeline_type
@@ -574,11 +656,18 @@ class Trellis2ImageTo3DPipeline(Pipeline):
         else:
             raise ValueError(f"Invalid pipeline type: {pipeline_type}")
         
+        images = image if isinstance(image, (list, tuple)) else [image]
         if preprocess_image:
-            image = self.preprocess_image(image)
+            images = [self.preprocess_image(im) for im in images]
         torch.manual_seed(seed)
-        cond_512 = self.get_cond([image], 512)
-        cond_1024 = self.get_cond([image], 1024) if pipeline_type != '512' else None
+        with self._multi_view(len(images), view_angles):
+            return self._run(images, num_samples, sparse_structure_sampler_params, shape_slat_sampler_params,
+                             tex_slat_sampler_params, return_latent, pipeline_type, max_num_tokens)
+
+    def _run(self, images, num_samples, sparse_structure_sampler_params, shape_slat_sampler_params,
+             tex_slat_sampler_params, return_latent, pipeline_type, max_num_tokens):
+        cond_512 = self.get_cond(images, 512)
+        cond_1024 = self.get_cond(images, 1024) if pipeline_type != '512' else None
         ss_res = {'512': 32, '1024': 64, '1024_cascade': 32, '1536_cascade': 32}[pipeline_type]
         coords = self.sample_sparse_structure(
             cond_512, ss_res,

@@ -275,7 +275,24 @@ def to_glb(
         voxel_size = (aabb[1] - aabb[0]) / grid_size
     grid_size, voxel_size, aabb = grid_size.cpu(), voxel_size.cpu(), aabb.cpu()
 
-    # --- Remeshing ---
+    v, f = remesh_snap(vertices, faces, coords, aabb, voxel_size, grid_size, min_component_area, min_piece_fraction,
+                       device, verbose, t0)
+
+    # --- Simplification and UV parameterization (Blender) ---
+    v, f, corner_uvs = _blender_decimate_unwrap(v, f, decimation_target, blender, island_margin=2 / texture_size)
+    _log(verbose, t0, f"decimated and unwrapped: {len(v)} vertices, {len(f)} faces")
+    return bake_textured(v, f, corner_uvs, attr_volume, coords, attr_layout, aabb, voxel_size, grid_size, texture_size,
+                         verbose, t0)
+
+
+def remesh_snap(vertices, faces, coords, aabb, voxel_size, grid_size, min_component_area, min_piece_fraction, device,
+                verbose=False, t0=None):
+    """
+    The surface rebuilt from the voxels as a closed manifold mesh, snapped onto TRELLIS's mesh for its sub-voxel detail
+    (to_glb's first step). aabb, voxel_size, grid_size: CPU tensors, as to_glb prepares them. Returns vertices (in the
+    aabb's units) and faces, as numpy arrays.
+    """
+    t0 = t0 or time.time()
     vs, lo = voxel_size.numpy().astype(np.float64), aabb[0].numpy().astype(np.float64)
     in_v = (vertices.detach().cpu().numpy().astype(np.float64) - lo) / vs     # voxel units
     in_v, in_f = _remove_small_components(in_v, faces.detach().cpu().numpy().astype(np.int64), min_component_area / float(vs.min()) ** 2)
@@ -294,10 +311,18 @@ def to_glb(
     v = v.cpu().numpy().astype(np.float64) * vs + lo
     _log(verbose, t0, f"snapped onto the input mesh: {float(dist.isfinite().float().mean()) * 100:.1f}% of the vertices")
 
-    # --- Simplification and UV parameterization (Blender) ---
-    v, f, corner_uvs = _blender_decimate_unwrap(v, f, decimation_target, blender, island_margin=2 / texture_size)
+    return v, f
+
+
+def bake_textured(v, f, corner_uvs, attr_volume, coords, attr_layout, aabb, voxel_size, grid_size, texture_size,
+                  verbose=False, t0=None) -> trimesh.Trimesh:
+    """
+    A triangle mesh (v, f) with a UV per face corner (corner_uvs, (F, 3, 2)) textured from the voxels' PBR attributes,
+    as a GLB-ready trimesh (to_glb's last step; y up, as glTF). aabb, voxel_size, grid_size: CPU tensors.
+    """
+    t0 = t0 or time.time()
+    device = attr_volume.device
     mesh = trimesh.Trimesh(v, f, process=False)
-    _log(verbose, t0, f"decimated and unwrapped: {len(v)} vertices, {len(f)} faces")
     # Split vertices along the UV seams: one output vertex per distinct (vertex, uv) pair
     corner_v = mesh.faces.reshape(-1)
     corner_uv = corner_uvs.reshape(-1, 2)
